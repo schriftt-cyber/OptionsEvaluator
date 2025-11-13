@@ -1,16 +1,22 @@
-# vol_scan_integration.py
 import datetime as dt
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import os
 
-
 from bokeh.resources import INLINE
 
 from bokeh.io import output_file, save
 from bokeh.layouts import layout
-from bokeh.models import ColumnDataSource, DataTable, TableColumn, HTMLTemplateFormatter, NumberFormatter, Tabs, TabPanel
+from bokeh.models import (
+    ColumnDataSource,
+    DataTable,
+    TableColumn,
+    HTMLTemplateFormatter,
+    NumberFormatter,
+    Tabs,
+    TabPanel,
+)
 
 # -----------------------
 # Defaults (15% profile)
@@ -34,17 +40,23 @@ DEFAULTS = dict(
     YELLOW_RULE={"WeightedScore_min": 2.5, "CategoryActiveCount_min": 3},
 )
 
+
 def _true_range(df):  # pandas DF with ['High','Low','Close']
     prev_close = df['Close'].shift(1)
-    tr = pd.concat([
-        (df['High'] - df['Low']).abs(),
-        (df['High'] - prev_close).abs(),
-        (df['Low'] - prev_close).abs()
-    ], axis=1).max(axis=1)
+    tr = pd.concat(
+        [
+            (df['High'] - df['Low']).abs(),
+            (df['High'] - prev_close).abs(),
+            (df['Low'] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
     return tr
+
 
 def _atr(df, period: int):
     return _true_range(df).rolling(period).mean()
+
 
 def _boll_bandwidth(close, period: int, std: float):
     ma = close.rolling(period).mean()
@@ -53,51 +65,63 @@ def _boll_bandwidth(close, period: int, std: float):
     lower = ma - std * sd
     return (upper - lower) / ma
 
+
 def _hist_vol(close, window: int):
     lr = np.log(close / close.shift(1))
     return lr.rolling(window).std(ddof=0) * np.sqrt(252)
 
+
 def _percent_rank(series, value: float):
     arr = series.dropna().values
-    if len(arr) == 0: return np.nan
+    if len(arr) == 0:
+        return np.nan
     return (np.sum(arr <= value) / len(arr)) * 100.0
+
 
 def _cross_200dma(df):
     ma200 = df['Close'].rolling(200).mean()
-    if ma200.isna().iloc[-1]: return None
+    if ma200.isna().iloc[-1]:
+        return None
     prev = df['Close'].iloc[-2] - ma200.iloc[-2]
     curr = df['Close'].iloc[-1] - ma200.iloc[-1]
-    if prev <= 0 < curr:  return "UpCross"
-    if prev >= 0 > curr:  return "DownCross"
+    if prev <= 0 < curr:
+        return "UpCross"
+    if prev >= 0 > curr:
+        return "DownCross"
     return None
+
 
 def _options_snapshot(ticker: str):
     try:
         tk = yf.Ticker(ticker)
         expiries = tk.options
-        if not expiries: return {"opt_total_vol": None, "put_call": None}
+        if not expiries:
+            return {"opt_total_vol": None, "put_call": None}
         today = dt.date.today()
         exp = None
         for e in expiries:
             try:
                 ed = dt.datetime.strptime(e, "%Y-%m-%d").date()
                 if ed >= today:
-                    exp = e; break
+                    exp = e
+                    break
             except Exception:
                 continue
-        if exp is None: return {"opt_total_vol": None, "put_call": None}
+        if exp is None:
+            return {"opt_total_vol": None, "put_call": None}
 
         chain = tk.option_chain(exp)
         calls = chain.calls if hasattr(chain, "calls") else pd.DataFrame()
-        puts  = chain.puts  if hasattr(chain, "puts")  else pd.DataFrame()
+        puts = chain.puts if hasattr(chain, "puts") else pd.DataFrame()
         call_vol = int(calls['volume'].fillna(0).sum()) if not calls.empty else 0
-        put_vol  = int(puts['volume'].fillna(0).sum())  if not puts.empty  else 0
+        put_vol = int(puts['volume'].fillna(0).sum()) if not puts.empty else 0
         total = call_vol + put_vol
         pcr = (put_vol / call_vol) if call_vol > 0 else (np.inf if put_vol > 0 else None)
         pcr_val = float(pcr) if pcr not in (None, np.inf) else (999.0 if pcr == np.inf else None)
         return {"opt_total_vol": total, "put_call": pcr_val}
     except Exception:
         return {"opt_total_vol": None, "put_call": None}
+
 
 def _analyze_ticker(ticker: str, cfg: dict):
     try:
@@ -136,7 +160,7 @@ def _analyze_ticker(ticker: str, cfg: dict):
                 period=f"{cfg['LOOKBACK_DAYS']}d",
                 interval="1d",
                 auto_adjust=False,
-                progress=False
+                progress=False,
             )
 
         if df is None or df.empty:
@@ -144,7 +168,6 @@ def _analyze_ticker(ticker: str, cfg: dict):
 
         # Clean
         df = df.dropna().copy()
-
 
         df['ATR'] = _atr(df, cfg['ATR_PERIOD'])
         atr_diff = df['ATR'] - df['ATR'].shift(1)
@@ -206,12 +229,16 @@ def _analyze_ticker(ticker: str, cfg: dict):
 
         # Recommendation
         active_cats = sum(1 for v in cat_hits.values() if v > 0)
-        if (weighted >= cfg['GREEN_RULE']["WeightedScore_min"]
+        if (
+            weighted >= cfg['GREEN_RULE']["WeightedScore_min"]
             and active_cats >= cfg['GREEN_RULE']["CategoryActiveCount_min"]
-            and (rvol >= cfg['GREEN_RULE']["RVOL_min"] if not np.isnan(rvol) else False)):
+            and (rvol >= cfg['GREEN_RULE']["RVOL_min"] if not np.isnan(rvol) else False)
+        ):
             rec, color = "GO", "#18A558"
-        elif (weighted >= cfg['YELLOW_RULE']["WeightedScore_min"]
-              and active_cats >= cfg['YELLOW_RULE']["CategoryActiveCount_min"]):
+        elif (
+            weighted >= cfg['YELLOW_RULE']["WeightedScore_min"]
+            and active_cats >= cfg['YELLOW_RULE']["CategoryActiveCount_min"]
+        ):
             rec, color = "WATCH", "#F4C430"
         else:
             rec, color = "PASS", "#D7263D"
@@ -241,6 +268,7 @@ def _analyze_ticker(ticker: str, cfg: dict):
     except Exception:
         return None
 
+
 def _badge_column():
     return """
     <div style="background-color:<%= RecColor %>; color:white; border-radius:12px;
@@ -249,14 +277,17 @@ def _badge_column():
     </div>
     """
 
+
 def _make_table(df):
     source = ColumnDataSource(df)
 
-    # Give explicit widths to avoid SlickGrid autosize path that throws "row is not defined"
     cols = [
         TableColumn(field="Ticker", title="Ticker", width=90),
         TableColumn(field="Price", title="Price", formatter=NumberFormatter(format="$0,0.00"), width=90),
-        # Badge is now prebuilt HTML; formatter just outputs it
+        # New: actual share volume from Schwab CSV (if present)
+        TableColumn(field="Vol", title="Vol", formatter=NumberFormatter(format="0,0"), width=110),
+
+        # Badge is prebuilt HTML
         TableColumn(field="RecBadge", title="Rec", formatter=HTMLTemplateFormatter(template="<%= value %>"), width=120),
 
         TableColumn(field="WeightedScore", title="Weighted", formatter=NumberFormatter(format="0.00"), width=100),
@@ -264,7 +295,8 @@ def _make_table(df):
         TableColumn(field="CategoryHits_Technical", title="Tech", width=70),
         TableColumn(field="CategoryHits_Participation", title="Part.", width=70),
         TableColumn(field="CategoryHits_Sentiment", title="Sent.", width=70),
-        TableColumn(field="CategoryHits_Volatility", title="Vol.", width=70),
+        # Renamed to avoid confusion with true volume
+        TableColumn(field="CategoryHits_Volatility", title="Vol Cat", width=70),
 
         TableColumn(field="RVOL", title="RVOL", formatter=NumberFormatter(format="0.00"), width=80),
         TableColumn(field="Range_mult_20d", title="Range×20d", formatter=NumberFormatter(format="0.00"), width=110),
@@ -277,24 +309,19 @@ def _make_table(df):
         TableColumn(field="Put_Call", title="Put/Call", width=80),
     ]
 
-    # Fixed size table avoids autosizeColumns() path in SlickGrid
-    # - reorderable=False removes jQuery-UI dependency
-    # - autosize_mode="none" prevents the autosize pass that throws "row is not defined"
-    # - sizing_mode=None so the table itself isn't stretch-resized (which can retrigger layout)
     return DataTable(
         source=source,
         columns=cols,
         index_position=None,
-        width=1600,                 # bump if you need more room
+        width=1700,
         height=600,
         row_height=28,
         sortable=True,
         selectable=True,
-        reorderable=False,          # important
-        autosize_mode="none",       # important
-        sizing_mode=None,           # important
+        reorderable=False,
+        autosize_mode="none",
+        sizing_mode=None,
     )
-
 
 
 # ---------- Public API ----------
@@ -305,21 +332,25 @@ def build_vol_table_df(tickers, preset="15%", csv_file=None):
 
     - If csv_file is provided, it's passed via cfg["LOCAL_CSV_PATH"] so _analyze_ticker()
       loads OHLCV from that CSV instead of yfinance.
-    - Adds a pre-rendered 'RecBadge' HTML column to avoid SlickGrid autosize/template issues.
+    - Also, if csv_file is provided and has Ticker/Date/Volume, we attach
+      the latest Volume per ticker as 'Vol' for display.
+    - Adds a pre-rendered 'RecBadge' HTML column.
     """
     cfg = DEFAULTS.copy()
 
     # Optional stricter preset
     if "30" in str(preset):
-        cfg.update(dict(
-            RVOL_MIN=3.0,
-            RANGE_MULT_MIN=2.0,
-            BASE_SQUEEZE_PCTL=10,
-            MIN_OPT_ABS_VOL=20000,
-            ATR_RISING_MIN_DAYS=5,
-            GREEN_RULE={"WeightedScore_min": 3.8, "CategoryActiveCount_min": 4, "RVOL_min": 3.0},
-            YELLOW_RULE={"WeightedScore_min": 2.8, "CategoryActiveCount_min": 3},
-        ))
+        cfg.update(
+            dict(
+                RVOL_MIN=3.0,
+                RANGE_MULT_MIN=2.0,
+                BASE_SQUEEZE_PCTL=10,
+                MIN_OPT_ABS_VOL=20000,
+                ATR_RISING_MIN_DAYS=5,
+                GREEN_RULE={"WeightedScore_min": 3.8, "CategoryActiveCount_min": 4, "RVOL_min": 3.0},
+                YELLOW_RULE={"WeightedScore_min": 2.8, "CategoryActiveCount_min": 3},
+            )
+        )
 
     # If a CSV was chosen in the GUI, use it
     if csv_file:
@@ -336,10 +367,32 @@ def build_vol_table_df(tickers, preset="15%", csv_file=None):
 
     df = pd.DataFrame(rows)
 
+    # Attach latest daily Volume per ticker as 'Vol' if we have a Schwab CSV
+    if csv_file:
+        try:
+            hist = pd.read_csv(csv_file, parse_dates=["Date"])
+            if {"Ticker", "Date", "Volume"}.issubset(hist.columns):
+                hist_sorted = hist.sort_values(["Ticker", "Date"])
+                last_by_ticker = (
+                    hist_sorted.groupby("Ticker")["Volume"]
+                    .last()
+                    .rename("Vol")
+                    .reset_index()
+                )
+                df = df.merge(last_by_ticker, on="Ticker", how="left")
+            else:
+                print("[WARN] CSV missing Ticker/Date/Volume; cannot attach Vol column")
+                df["Vol"] = pd.NA
+        except Exception as e:
+            print(f"[WARN] Failed to attach Vol from {csv_file}: {e}")
+            df["Vol"] = pd.NA
+    else:
+        df["Vol"] = pd.NA
+
     # Prebuild badge HTML so the DataTable template can safely use <%= value %>
     def _badge_html(row):
         color = row.get("RecColor", "#444")
-        text  = row.get("Recommendation", "")
+        text = row.get("Recommendation", "")
         return (
             f"<div style='background-color:{color}; color:white; border-radius:12px;"
             f" padding:2px 8px; text-align:center; font-weight:600;'>{text}</div>"
@@ -347,12 +400,21 @@ def build_vol_table_df(tickers, preset="15%", csv_file=None):
 
     df["RecBadge"] = df.apply(_badge_html, axis=1)
 
-    # Order rows: strongest first (within PASS/WATCH/GO groups the sort puts GO first because ascending=True on text would be wrong;
-    # we rely on the existing Recommendation values being grouped by the earlier pipeline; if you want strict ordering, map to rank and sort on it)
-    df = (df.sort_values(
-            ["Recommendation", "WeightedScore", "CategoryActiveCount", "RVOL"],
-            ascending=[True, False, False, False]
-         ).reset_index(drop=True))
+    # Order rows: strongest first
+    df = df.sort_values(
+        ["Recommendation", "WeightedScore", "CategoryActiveCount", "RVOL"],
+        ascending=[True, False, False, False],
+    ).reset_index(drop=True)
+
+    # Debug: confirm Vol exists and looks sane
+    print("\n[DEBUG] vol_df columns:", list(df.columns))
+    if "Vol" in df.columns:
+        print("[DEBUG] Vol stats:")
+        print(df["Vol"].describe())
+        print("[DEBUG] Sample Vol rows:")
+        print(df[["Ticker", "Vol"]].head(20))
+    else:
+        print("[DEBUG] No 'Vol' column in vol_df!")
 
     return df
 
@@ -362,22 +424,20 @@ def render_vol_table_html(df, outfile="vol_scanner_summary.html", title="Indicat
     Save the volatility scan DataTable to an HTML file in the 'csv_html' folder.
     Automatically creates the folder if it doesn't exist.
     """
-    # Ensure the folder exists (same level as this script)
     base_dir = os.path.dirname(os.path.abspath(__file__))
     html_dir = os.path.join(base_dir, "csv_html")
     os.makedirs(html_dir, exist_ok=True)
 
-    # Full output path
     out_path = os.path.join(html_dir, outfile)
 
-    # Create Bokeh table layout and save inline (no external JS needed)
     table = _make_table(df)
     output_file(out_path, title=title)
     save(layout([[table]]), resources=INLINE)
 
     return out_path
 
+
 def tab_for_vol_table(df, title="Vol Scanner"):
-    """Return a **TabPanel** to append into your existing Bokeh Tabs."""
+    """Return a TabPanel to append into your existing Bokeh Tabs."""
     table = _make_table(df)
     return TabPanel(child=layout([[table]]), title=title)

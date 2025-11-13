@@ -1,0 +1,6 @@
+AAPL
+MSFT
+NVDA
+# comment lines are fine
+SPY
+DXCM
