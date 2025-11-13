@@ -9,7 +9,9 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-# --- Tkinter UI ---
+import subprocess
+import traceback
+
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
 from tkinter.scrolledtext import ScrolledText
@@ -22,6 +24,8 @@ try:
     from bokeh.resources import INLINE
 except Exception:
     np = None
+
+BASE_DIR = Path(__file__).resolve().parent
 
 # ----------------------------
 # Browser helper (prefer Chrome)
@@ -50,32 +54,8 @@ def _open_in_chrome(url: str) -> bool:
 
 
 # ----------------------------
-# Indicators hook (stub)
-# ----------------------------
-def run_indicators_pipeline(log_fn=print):
-    """
-    DROP-IN ZONE #1: Replace this with your real indicators pipeline.
-    Keep it non-blocking to the UI by running in a thread (already handled).
-    """
-    try:
-        steps = [
-            "Loading data",
-            "Calculating indicators (RSI, MACD, ATR, OBV…)",
-            "Validating results",
-            "Writing outputs",
-        ]
-        for s in steps:
-            log_fn(f"[Indicators] {s}...")
-            time.sleep(0.6)
-        log_fn("[Indicators] Done ✅")
-    except Exception as e:
-        log_fn(f"[Indicators] ERROR: {e}")
-
-
-# ----------------------------
 # Vol scanner module loader
 # ----------------------------
-import traceback
 import importlib.util
 
 def _load_vol_scan_module(log_fn=print):
@@ -341,7 +321,7 @@ class App(tk.Tk):
         btns.pack(side=tk.TOP, fill=tk.X, padx=12, pady=8)
 
         self.btn_ind = ttk.Button(btns, text="Run Indicators",
-                                  command=self._on_run_indicators)
+                                  command=self.run_indicators)
         self.btn_ind.pack(side=tk.LEFT, padx=6)
 
         # Button for CSV-based payoff plotting
@@ -389,20 +369,100 @@ class App(tk.Tk):
         t = threading.Thread(target=target, args=args, kwargs=kwargs, daemon=True)
         t.start()
 
-    # --- button handlers ---
-    def _on_run_indicators(self):
-        self._log("Starting Indicators…")
-        self.btn_ind.config(state=tk.DISABLED)
+    # --- Run Indicators (popup + Schwab CSV) ---
+    def run_indicators(self):
+        """
+        Ask the user for a ticker, then run the indicators dashboard using the
+        already-downloaded Schwab OHLCV data.
+
+        Prefers the GUI-generated Schwab CSV (schwab_ohlcv_gui.csv), but will
+        fall back to schwab_ohlcv.csv if that one exists instead.
+        """
+        ticker = simpledialog.askstring(
+            "Run Indicators",
+            "Enter ticker symbol (e.g. AAPL, NVDA, SPY):",
+            parent=self,
+        )
+        if not ticker:
+            # user cancelled or left blank
+            self._log("Indicators cancelled.")
+            return
+
+        ticker = ticker.strip().upper()
+        if not ticker:
+            messagebox.showerror("Error", "Ticker cannot be empty.")
+            return
+
+        # Prefer the GUI Schwab file, fall back to CLI one
+        schwab_csv_gui = BASE_DIR / "csv_html" / "schwab_ohlcv_gui.csv"
+        schwab_csv_cli = BASE_DIR / "csv_html" / "schwab_ohlcv.csv"
+
+        if schwab_csv_gui.exists():
+            schwab_csv = schwab_csv_gui
+        elif schwab_csv_cli.exists():
+            schwab_csv = schwab_csv_cli
+        else:
+            messagebox.showerror(
+                "Error",
+                "No Schwab OHLCV CSV found.\n\n"
+                f"Tried:\n  {schwab_csv_gui}\n  {schwab_csv_cli}\n\n"
+                "Run either the Schwab Vol Scanner from the GUI\n"
+                "or schwab_vol_scan_prep.py first.",
+            )
+            return
+
+        script = BASE_DIR / "indicators_dashboard_from_schwab.py"
+        if not script.exists():
+            messagebox.showerror(
+                "Error",
+                f"Indicator script not found:\n{script}\n\n"
+                f"Make sure you saved indicators_dashboard_from_schwab.py in the repo root.",
+            )
+            return
+
+        self._log(f"Running indicators for {ticker} using {schwab_csv.name}...")
 
         def job():
-            try:
-                run_indicators_pipeline(log_fn=self._log)
-            finally:
-                self.btn_ind.config(state=tk.NORMAL)
-                self._log("Indicators task finished.")
+            # capture stdout/stderr so we can show the real error
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--ticker",
+                    ticker,
+                    "--schwab-csv",
+                    str(schwab_csv),
+                ],
+                capture_output=True,
+                text=True,
+            )
 
+            if result.returncode == 0:
+                self._log(f"Indicators dashboard generated for {ticker}.")
+                if result.stdout.strip():
+                    self._log("[Indicators stdout]")
+                    self._log(result.stdout.strip())
+            else:
+                self._log(f"[Indicators] script exited with code {result.returncode}")
+                if result.stdout.strip():
+                    self._log("[Indicators stdout]")
+                    self._log(result.stdout.strip())
+                if result.stderr.strip():
+                    self._log("[Indicators stderr]")
+                    self._log(result.stderr.strip())
+
+                messagebox.showerror(
+                    "Indicators Error",
+                    "Indicators script failed.\n\n"
+                    f"Exit code: {result.returncode}\n\n"
+                    f"STDOUT:\n{result.stdout[-1000:]}\n\n"
+                    f"STDERR:\n{result.stderr[-1000:]}"
+                )
+
+        # Run in background so GUI doesn't freeze
         self._run_bg(job)
 
+    # --- button handlers ---
     def _on_plot_from_csv(self):
         path = filedialog.askopenfilename(
             title="Select options_input.csv",
