@@ -11,6 +11,8 @@ Usage (from repo root):
 This script does NOT rely on your 'indicators' package. It implements basic
 indicators itself (SMA, Bollinger Bands, RSI, MACD, ATR) and renders a
 multi-panel Bokeh dashboard.
+
+Dashboards are ALWAYS written into the csv_html folder.
 """
 
 import argparse
@@ -138,6 +140,8 @@ def build_dashboard(df: pd.DataFrame, ticker: str):
     - Volume
     - RSI(14)
     - MACD (line, signal, histogram)
+
+    Figures are made explicitly wide so they don't look cramped.
     """
     df = df.copy()
 
@@ -167,19 +171,23 @@ def build_dashboard(df: pd.DataFrame, ticker: str):
     if "date" not in df_reset.columns:
         df_reset.rename(columns={df_reset.columns[0]: "date"}, inplace=True)
 
+    # width control: make everything wide
+    plot_width = 1600
+
     # --- Price + BB + SMAs ---
     p_price = figure(
         x_axis_type="datetime",
         title=f"{ticker} Price with SMAs & Bollinger Bands",
         height=300,
-        sizing_mode="stretch_width",
+        width=plot_width,
+        sizing_mode="fixed",
     )
-    p_price.line(df_reset["date"], df_reset["close"], legend_label="Close", line_width=2)
+    p_price.line(df_reset["date"], df_reset["close"], legend_label="Close", line_width=2, line_color="green")
     p_price.line(df_reset["date"], df_reset["sma20"], legend_label="SMA20", line_width=1)
     p_price.line(df_reset["date"], df_reset["sma50"], legend_label="SMA50", line_width=1)
     p_price.line(df_reset["date"], df_reset["sma200"], legend_label="SMA200", line_width=1)
-    p_price.line(df_reset["date"], df_reset["bb_upper"], legend_label="BB Upper", line_width=1)
-    p_price.line(df_reset["date"], df_reset["bb_lower"], legend_label="BB Lower", line_width=1)
+    p_price.line(df_reset["date"], df_reset["bb_upper"], legend_label="BB Upper", line_width=1, line_color="red")
+    p_price.line(df_reset["date"], df_reset["bb_lower"], legend_label="BB Lower", line_width=1, line_color="red")
     p_price.legend.location = "top_left"
 
     # --- Volume ---
@@ -187,10 +195,10 @@ def build_dashboard(df: pd.DataFrame, ticker: str):
         x_axis_type="datetime",
         title="Volume",
         height=150,
-        sizing_mode="stretch_width",
-        x_range=p_price.x_range,
+        width=plot_width,
+        sizing_mode="fixed",
+        x_range=p_price.x_range,  # link x-range so zoom/pan syncs
     )
-    # width ~ 0.8 trading day in ms
     day_ms = 24 * 60 * 60 * 1000
     p_vol.vbar(
         x=df_reset["date"],
@@ -204,7 +212,8 @@ def build_dashboard(df: pd.DataFrame, ticker: str):
         x_axis_type="datetime",
         title="RSI(14)",
         height=150,
-        sizing_mode="stretch_width",
+        width=plot_width,
+        sizing_mode="fixed",
         x_range=p_price.x_range,
         y_range=(0, 100),
     )
@@ -217,7 +226,8 @@ def build_dashboard(df: pd.DataFrame, ticker: str):
         x_axis_type="datetime",
         title="MACD",
         height=200,
-        sizing_mode="stretch_width",
+        width=plot_width,
+        sizing_mode="fixed",
         x_range=p_price.x_range,
     )
     p_macd.line(df_reset["date"], df_reset["macd"], line_width=2, legend_label="MACD")
@@ -244,7 +254,16 @@ def build_dashboard(df: pd.DataFrame, ticker: str):
     )
     p_macd.legend.location = "top_left"
 
-    return column(p_price, p_vol, p_rsi, p_macd)
+    # Column layout; keep fixed width so it respects our plot_width
+    layout = column(
+        p_price,
+        p_vol,
+        p_rsi,
+        p_macd,
+        sizing_mode="fixed",
+    )
+
+    return layout
 
 
 # ---------------------------------------------------------------------------
@@ -271,8 +290,9 @@ def main():
         type=Path,
         default=None,
         help=(
-            "Optional output HTML filename; default: "
-            "csv_html/indicators_dashboard_<TICKER>.html"
+            "Optional output HTML filename (no path needed). "
+            "It will always be saved under csv_html/. "
+            "Default: indicators_dashboard_<TICKER>.html"
         ),
     )
     args = parser.parse_args()
@@ -280,13 +300,19 @@ def main():
     df = load_df_from_schwab(args.schwab_csv, args.ticker)
     ticker = args.ticker.upper()
 
+    # ALWAYS save into csv_html folder
     html_dir = BASE_DIR / "csv_html"
     html_dir.mkdir(parents=True, exist_ok=True)
 
     if args.html is not None:
-        html_path = args.html
-        if not html_path.is_absolute():
-            html_path = html_dir / html_path
+        # If user gave just a name like 'foo.html', put it under csv_html
+        if args.html.is_absolute():
+            # You said you want them all under csv_html, so even if absolute
+            # was provided, we still force it into csv_html by name only.
+            name = args.html.name
+            html_path = html_dir / name
+        else:
+            html_path = html_dir / args.html
     else:
         html_path = html_dir / f"indicators_dashboard_{ticker}.html"
 
