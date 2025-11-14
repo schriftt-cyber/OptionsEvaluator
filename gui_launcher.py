@@ -20,7 +20,17 @@ from tkinter.scrolledtext import ScrolledText
 try:
     import numpy as np
     from bokeh.plotting import figure, output_file, save
-    from bokeh.models import Label, Span, Tabs, TabPanel
+    from bokeh.models import (
+        Label,
+        Span,
+        Tabs,
+        TabPanel,
+        HoverTool,
+        CrosshairTool,
+        TapTool,
+        ColumnDataSource,
+        CustomJS,
+    )
     from bokeh.resources import INLINE
 except Exception:
     np = None
@@ -113,7 +123,7 @@ def _ticker_list_from_file(path):
 @dataclass
 class OptionInputs:
     ticker: str
-    spot: float        # current price S0
+    spot: float        # current price S0 (will be set from Schwab if available)
     call_strike: float
     call_premium: float
     put_strike: float
@@ -126,10 +136,20 @@ class OptionInputs:
 def read_option_inputs_csv(path):
     """
     Reads a CSV file with columns:
-      strategy,ticker,spot,call_strike,call_premium,put_strike,put_premium,price_min,price_max,step
+      strategy,ticker,call_strike,call_premium,put_strike,put_premium
 
-    Returns:
-      list[OptionInputs] — one OptionInputs object per CSV row.
+    The 'spot' column is optional and ONLY used as a fallback if Schwab
+    prices cannot be fetched. The plots will normally use live prices
+    from Charles Schwab instead.
+
+    price_min, price_max, and step are derived automatically:
+      - step = 0.01
+      - For a straddle  (Kc == Kp):
+            price_min = Kc - 3 * (call_premium + put_premium)
+            price_max = Kc + 3 * (call_premium + put_premium)
+      - For a strangle (Kp < Kc):
+            price_min = Kp - 3 * (call_premium + put_premium)
+            price_max = Kc + 3 * (call_premium + put_premium)
     """
     import csv
 
@@ -137,14 +157,20 @@ def read_option_inputs_csv(path):
     with open(path, newline="", encoding="utf-8-sig") as f:
         rdr = csv.DictReader(f)
 
-        # Required headers
+        # Spot is no longer required
         required = [
-            "strategy", "ticker", "spot", "call_strike", "call_premium",
-            "put_strike", "put_premium", "price_min", "price_max", "step",
+            "strategy",
+            "ticker",
+            "call_strike",
+            "call_premium",
+            "put_strike",
+            "put_premium",
         ]
         missing = [c for c in required if c not in rdr.fieldnames]
         if missing:
             raise ValueError(f"CSV missing required columns: {missing}")
+
+        has_spot_col = "spot" in (rdr.fieldnames or [])
 
         for i, r in enumerate(rdr, start=2):  # header is row 1
             try:
@@ -152,27 +178,45 @@ def read_option_inputs_csv(path):
                 if strategy not in ("strangle", "straddle"):
                     raise ValueError(f"Row {i}: strategy must be 'strangle' or 'straddle'.")
 
-                def fget(k):
-                    return float(str(r[k]).strip())
+                def fget(k): return float(str(r[k]).strip())
 
-                spot = fget("spot")
+                # Optional: CSV may still include spot; we keep it ONLY as fallback.
+                spot = None
+                if has_spot_col:
+                    val = (r.get("spot") or "").strip()
+                    if val:
+                        spot = float(val)
+
                 kc = fget("call_strike")
-                c = fget("call_premium")
+                c  = fget("call_premium")
                 kp = fget("put_strike")
-                p = fget("put_premium")
-                pmin = fget("price_min")
-                pmax = fget("price_max")
-                step = fget("step")
+                p  = fget("put_premium")
 
+                total_premium = c + p
+                step = 0.01  # your updated step
+
+                # For a straddle, put strike is same as call strike
                 if strategy == "straddle":
                     kp = kc
 
+                # Set plotting range based on strikes and total premium
+                if strategy == "straddle":
+                    price_min = kc - 3.0 * total_premium
+                    price_max = kc + 3.0 * total_premium
+                else:  # strangle
+                    price_min = kp - 3.0 * total_premium
+                    price_max = kc + 3.0 * total_premium
+
                 rows.append(OptionInputs(
-                    ticker=r["ticker"].strip() or "TICKER",
-                    spot=spot,
-                    call_strike=kc, call_premium=c,
-                    put_strike=kp, put_premium=p,
-                    price_min=pmin, price_max=pmax, step=step,
+                    ticker=r["ticker"].strip().upper() or "TICKER",
+                    spot=spot if spot is not None else 0.0,  # will be replaced by Schwab
+                    call_strike=kc,
+                    call_premium=c,
+                    put_strike=kp,
+                    put_premium=p,
+                    price_min=price_min,
+                    price_max=price_max,
+                    step=step,
                 ))
             except Exception as e:
                 raise ValueError(f"Error parsing row {i}: {e}") from e
@@ -183,19 +227,34 @@ def read_option_inputs_csv(path):
 def _make_payoff_figure(inp: OptionInputs):
     """
     Return a single Bokeh Figure for one straddle/strangle input.
-    No disk writes, no browser opens—just a figure to compose later.
+    Shows:
+      - Total payoff
+      - Individual call/put legs
+      - Per-leg ITM start (strike) and per-leg break-evens
+      - Current price point in green with current payoff
+      - Last up to 9 prior closes as smaller, fading green dots (no labels)
+      - Total premium annotation
+      - Interactive hover and click to show Price & P/L
     """
     if np is None:
         raise RuntimeError("Missing dependencies. Install with: pip install bokeh numpy")
 
+    # Price grid
     S = np.arange(inp.price_min, inp.price_max + inp.step, inp.step)
-    call_leg = np.maximum(0.0, S - inp.call_strike) - inp.call_premium
-    put_leg = np.maximum(0.0, inp.put_strike - S) - inp.put_premium
-    payoff = call_leg + put_leg
 
+    # Legs and combined payoff (at expiration)
+    call_leg = np.maximum(0.0, S - inp.call_strike) - inp.call_premium
+    put_leg  = np.maximum(0.0, inp.put_strike - S) - inp.put_premium
+    payoff   = call_leg + put_leg
+
+    # Combined-strategy break-evens
     total_premium = inp.call_premium + inp.put_premium
     be_lower = inp.put_strike - total_premium
     be_upper = inp.call_strike + total_premium
+
+    # Per-leg break-evens (where each individual option crosses 0 P/L)
+    call_be = inp.call_strike + inp.call_premium
+    put_be  = inp.put_strike - inp.put_premium
 
     p = figure(
         title=f"{inp.ticker} Payoff (Strangle/Straddle)",
@@ -205,35 +264,220 @@ def _make_payoff_figure(inp: OptionInputs):
         sizing_mode="stretch_both",
         min_width=1000,
         min_height=500,
+        tools="pan,wheel_zoom,box_zoom,reset",
+        active_drag="pan",
+        active_scroll="wheel_zoom",
     )
 
-    # Curve
-    p.line(S, payoff, line_width=3)
+    # Force x-axis to exactly match price_min/price_max
+    p.x_range.start = inp.price_min
+    p.x_range.end   = inp.price_max
 
-    # Zero line
+    from bokeh.models import (
+        Label,
+        Span,
+        HoverTool,
+        CrosshairTool,
+        TapTool,
+        ColumnDataSource,
+        CustomJS,
+    )
+
+    # Data source for the main payoff curve (for hover/tap)
+    source = ColumnDataSource(data=dict(S=S, payoff=payoff))
+
+    # --- Main lines ---
+    # Total payoff (using source so hover/tap work)
+    line_renderer = p.line(
+        'S', 'payoff',
+        source=source,
+        line_width=3,
+        legend_label="Total payoff",
+    )
+
+    # Invisible points solely for better hit-testing on tap (click)
+    hit_renderer = p.scatter(
+        'S', 'payoff',
+        source=source,
+        size=5,
+        alpha=0.0,
+    )
+
+    # Individual legs (helps explain the shape)
+    p.line(S, call_leg, line_width=1, line_dash="dashed", alpha=0.7,
+           legend_label="Call leg")
+    p.line(S, put_leg, line_width=1, line_dash="dotted", alpha=0.7,
+           legend_label="Put leg")
+
+    # Zero P/L line
     p.add_layout(Span(location=0, dimension='width', line_color='gray',
                       line_dash='dashed', line_width=1))
 
-    # Break-evens
+    # Combined-strategy break-even verticals
     p.add_layout(Span(location=be_lower, dimension='height',
                       line_dash='dotted', line_width=2))
     p.add_layout(Span(location=be_upper, dimension='height',
                       line_dash='dotted', line_width=2))
 
     y_top = float(np.nanmax(payoff)) if payoff.size else 0.0
+    y_bottom = float(np.nanmin(payoff)) if payoff.size else 0.0
+
     p.add_layout(Label(x=be_lower, y=y_top, x_offset=5, y_offset=-20,
                        text=f"BE Lower ≈ {be_lower:.2f}"))
     p.add_layout(Label(x=be_upper, y=y_top, x_offset=5, y_offset=-20,
                        text=f"BE Upper ≈ {be_upper:.2f}"))
 
-    # Current price marker
-    idx = int(np.clip(round((inp.spot - inp.price_min) / inp.step), 0, len(S) - 1))
-    spot_payoff = payoff[idx]
-    p.scatter([inp.spot], [spot_payoff], size=10)
-    p.add_layout(Label(x=inp.spot, y=spot_payoff, x_offset=8, y_offset=8,
-                       text=f"S0={inp.spot:.2f}, P/L={spot_payoff:.2f}"))
+    # Total premium annotation
+    premium_text = f"Total premium (debit): {total_premium:.2f}"
+    p.add_layout(Label(
+        x=inp.price_min,
+        y=y_top,
+        x_offset=5,
+        y_offset=5,
+        text=premium_text,
+    ))
+
+    # Helper to grab the nearest y from a given x on a particular leg
+    def _nearest_xy(x_target: float, y_array: np.ndarray):
+        if x_target < inp.price_min or x_target > inp.price_max:
+            return None
+        idx = int(np.clip(round((x_target - inp.price_min) / inp.step),
+                          0, len(S) - 1))
+        return S[idx], float(y_array[idx])
+
+    # --- Per-leg ITM start (strike) markers ---
+    # Call ITM start: stock price crosses call_strike
+    call_itm = _nearest_xy(inp.call_strike, call_leg)
+    if call_itm is not None:
+        x, y = call_itm
+        p.scatter([x], [y], size=8, color="orange")
+        p.add_layout(Label(x=x, y=y, x_offset=5, y_offset=5,
+                           text=f"Call ITM @ {x:.2f}",
+                           text_color="orange"))
+
+    # Put ITM start: stock price crosses put_strike (below)
+    put_itm = _nearest_xy(inp.put_strike, put_leg)
+    if put_itm is not None:
+        x, y = put_itm
+        p.scatter([x], [y], size=8, color="purple")
+        p.add_layout(Label(x=x, y=y, x_offset=5, y_offset=5,
+                           text=f"Put ITM @ {x:.2f}",
+                           text_color="purple"))
+
+    # --- Per-leg break-even markers ---
+    call_be_xy = _nearest_xy(call_be, call_leg)
+    if call_be_xy is not None:
+        x, y = call_be_xy
+        p.scatter([x], [y], size=8, color="orange")
+        p.add_layout(Label(x=x, y=y, x_offset=5, y_offset=-15,
+                           text=f"Call BE @ {x:.2f}",
+                           text_color="orange"))
+
+    put_be_xy = _nearest_xy(put_be, put_leg)
+    if put_be_xy is not None:
+        x, y = put_be_xy
+        p.scatter([x], [y], size=8, color="purple")
+        p.add_layout(Label(x=x, y=y, x_offset=5, y_offset=-15,
+                           text=f"Put BE @ {x:.2f}",
+                           text_color="purple"))
+
+    # --- Recent close markers (small green dots, fading with age) ---
+    recent = getattr(inp, "recent_closes", None)
+    if recent and len(recent) >= 2:
+        # Use all but the most recent as "history" (past days only)
+        past_closes = recent[:-1]
+        past_closes = past_closes[-9:]  # last 9
+        n = len(past_closes)
+
+        # Iterate newest past first so we can fade older ones
+        for idx, s_val in enumerate(reversed(past_closes)):
+            payoff_val = (
+                max(0.0, s_val - inp.call_strike) - inp.call_premium +
+                max(0.0, inp.put_strike - s_val) - inp.put_premium
+            )
+
+            # Weight for size/alpha (newer = bigger & less transparent)
+            frac = 1.0 - (idx + 1) / (n + 1)  # decreases with idx
+            size = 6 + 6 * frac               # between ~6 and 12
+            alpha = 0.3 + 0.4 * frac          # between ~0.3 and 0.7
+
+            p.scatter(
+                [s_val],
+                [payoff_val],
+                size=size,
+                color="green",
+                alpha=alpha,
+            )
+
+    # --- Current price marker (largest green dot with label) ---
+    spot = inp.spot
+    spot_payoff = (
+        max(0.0, spot - inp.call_strike) - inp.call_premium +
+        max(0.0, inp.put_strike - spot) - inp.put_premium
+    )
+
+    p.scatter([spot], [spot_payoff], size=12, color="green")
+    p.add_layout(Label(
+        x=spot, y=spot_payoff,
+        x_offset=8, y_offset=8,
+        text=f"Current S={spot:.2f}, P/L={spot_payoff:.2f}",
+        text_color="green",
+    ))
+
+    # --- Hover and click tools for Price & P/L ---
+    # Hover: attach to the line renderer so we only get ONE Price/P&L per x
+    hover = HoverTool(
+        tooltips=[
+            ("Price", "@S{0.00}"),
+            ("P/L", "@payoff{0.00}"),
+        ],
+        mode="vline",
+        renderers=[line_renderer],
+    )
+
+    crosshair = CrosshairTool(dimensions="both")
+
+    # Label that will be updated on click
+    click_label = Label(
+        x=inp.price_min,
+        y=y_bottom,
+        x_offset=10,
+        y_offset=10,
+        text="",
+        text_font_style="bold",
+        text_color="black",
+    )
+    p.add_layout(click_label)
+
+    tap_callback = CustomJS(
+        args=dict(source=source, label=click_label),
+        code="""
+        const inds = source.selected.indices;
+        if (inds.length === 0) {
+            return;
+        }
+        const i = inds[0];
+        const x = source.data['S'][i];
+        const y = source.data['payoff'][i];
+        label.x = x;
+        label.y = y;
+        label.text = `Price=${x.toFixed(2)}, P/L=${y.toFixed(2)}`;
+        label.visible = true;
+        label.change.emit();
+        """
+    )
+
+    # Tap: still use the invisible scatter (hit_renderer) for selection
+    taptool = TapTool(callback=tap_callback, renderers=[hit_renderer])
+
+    p.add_tools(hover, crosshair, taptool)
+
+    # Legend tweaks
+    p.legend.location = "top_left"
+    p.legend.click_policy = "hide"
 
     return p
+
 
 
 def _fallback_compute_strangle(inp: OptionInputs):
@@ -480,6 +724,80 @@ class App(tk.Tk):
         if not inputs_list:
             messagebox.showinfo("No rows", "CSV has no data rows.")
             return
+
+        # ---------------------------------------------------------
+        # Fetch current spot prices + recent history from Schwab
+        # ---------------------------------------------------------
+        tickers = sorted({inp.ticker for inp in inputs_list})
+        self._log(f"[Schwab] Fetching current prices for {len(tickers)} ticker(s): {tickers}")
+
+        price_map = {}
+        history_map = {}  # ticker -> list of recent closes (oldest -> newest)
+
+        try:
+            from schwab_vol_scan_prep import fetch_ohlcv_for_tickers
+            # Use a slightly longer lookback so we can get at least 9 recent closes
+            df = fetch_ohlcv_for_tickers(tickers, lookback_days=15)
+
+            if df is not None and not df.empty:
+                # Try to find a "close" column (case-insensitive)
+                cols_lower = {c.lower(): c for c in df.columns}
+                close_col = None
+                for cand in ("close", "adjclose", "adj_close", "last"):
+                    if cand in cols_lower:
+                        close_col = cols_lower[cand]
+                        break
+
+                if close_col is None:
+                    self._log("[Schwab] No close/last price column found in OHLCV data.")
+                elif "Ticker" not in df.columns:
+                    self._log("[Schwab] No 'Ticker' column in OHLCV data.")
+                else:
+                    # Try to find a date-like column for ordering
+                    date_col_key = None
+                    for cand in ("date", "timestamp", "datetime"):
+                        if cand in cols_lower:
+                            date_col_key = cand
+                            break
+                    date_col = cols_lower[date_col_key] if date_col_key else None
+
+                    for t in tickers:
+                        df_t = df[df["Ticker"] == t]
+                        if df_t.empty:
+                            continue
+                        if date_col:
+                            df_t = df_t.sort_values(date_col)
+
+                        closes = df_t[close_col].tolist()
+                        # Keep only the last 10 closes (oldest -> newest)
+                        closes = closes[-10:]
+                        if not closes:
+                            continue
+
+                        history_map[t] = closes
+                        # Most recent close is the "current" spot
+                        price_map[t] = float(closes[-1])
+
+            self._log(f"[Schwab] Got prices for {len(price_map)} ticker(s).")
+        except ImportError as e:
+            self._log(f"[Schwab] Could not import schwab_vol_scan_prep: {e}")
+            self._log("[Schwab] Using CSV spot values (if provided).")
+        except Exception as e:
+            self._log(f"[Schwab] ERROR fetching prices: {e}")
+            self._log(traceback.format_exc())
+            self._log("[Schwab] Using CSV spot values (if provided).")
+
+        # Overwrite inp.spot with Schwab price when available, and attach history
+        for inp in inputs_list:
+            if inp.ticker in price_map:
+                inp.spot = price_map[inp.ticker]
+                setattr(inp, "recent_closes", history_map.get(inp.ticker, []))
+            else:
+                # Fallback if we couldn't get a price and CSV had no spot:
+                if not inp.spot:
+                    inp.spot = (inp.call_strike + inp.put_strike) / 2.0
+                self._log(f"[Schwab] No live price for {inp.ticker}; using fallback spot={inp.spot:.2f}")
+                setattr(inp, "recent_closes", [])
 
         self._log(f"Loaded {len(inputs_list)} row(s) from CSV. Building combined HTML with tabs…")
         self.btn_csv.config(state=tk.DISABLED)
