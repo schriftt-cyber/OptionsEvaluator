@@ -31,12 +31,12 @@ def _price_history_to_df(symbol: str, history: dict) -> pd.DataFrame:
     If Schwab changes the schema, print(history) once and adjust this mapping.
     """
     # --- DEBUG: show top-level keys and first candle ---
-    print(f"\n[DEBUG] Raw history for {symbol}: keys = {list(history.keys())}")
+    #print(f"\n[DEBUG] Raw history for {symbol}: keys = {list(history.keys())}")
     candles = history.get("candles", [])
-    if candles:
-        print(f"[DEBUG] First candle for {symbol}: {candles[0]}")
-    else:
-        print(f"[DEBUG] No candles in history for {symbol}")
+    #if candles:
+    #    print(f"[DEBUG] First candle for {symbol}: {candles[0]}")
+    #else:
+    #    print(f"[DEBUG] No candles in history for {symbol}")
 
     rows = []
     for c in candles:
@@ -62,13 +62,13 @@ def _price_history_to_df(symbol: str, history: dict) -> pd.DataFrame:
     df = pd.DataFrame(rows)
 
     # --- DEBUG: show last few rows and volume stats for this symbol ---
-    if not df.empty:
-        print(f"[DEBUG] DataFrame for {symbol} (tail):")
-        print(df.tail())
-        print(f"[DEBUG] Volume stats for {symbol}:")
-        print(df["Volume"].describe())
-    else:
-        print(f"[DEBUG] DataFrame for {symbol} is EMPTY")
+    #if not df.empty:
+    #    print(f"[DEBUG] DataFrame for {symbol} (tail):")
+    #    print(df.tail())
+    #    print(f"[DEBUG] Volume stats for {symbol}:")
+    #    print(df["Volume"].describe())
+    #else:
+    #    print(f"[DEBUG] DataFrame for {symbol} is EMPTY")
 
     return df
 
@@ -123,10 +123,10 @@ def fetch_ohlcv_for_tickers(
     df_all.sort_values(["Ticker", "Date"], inplace=True)
 
     # --- DEBUG: global sanity check on Volume column ---
-    print("\n[DEBUG] Combined df_all head():")
-    print(df_all.head())
-    print("\n[DEBUG] Combined Volume stats by ticker:")
-    print(df_all.groupby("Ticker")["Volume"].describe())
+    #print("\n[DEBUG] Combined df_all head():")
+    #print(df_all.head())
+    #print("\n[DEBUG] Combined Volume stats by ticker:")
+    #print(df_all.groupby("Ticker")["Volume"].describe())
 
     return df_all
 

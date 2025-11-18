@@ -40,6 +40,8 @@ BASE_DIR = Path(__file__).resolve().parent
 # ----------------------------
 # Browser helper (prefer Chrome)
 # ----------------------------
+
+
 def _open_in_chrome(url: str) -> bool:
     """
     Try to open a URL specifically in Google Chrome on Windows.
@@ -67,6 +69,7 @@ def _open_in_chrome(url: str) -> bool:
 # Vol scanner module loader
 # ----------------------------
 import importlib.util
+
 
 def _load_vol_scan_module(log_fn=print):
     """
@@ -188,9 +191,9 @@ def read_option_inputs_csv(path):
                         spot = float(val)
 
                 kc = fget("call_strike")
-                c  = fget("call_premium")
+                c = fget("call_premium")
                 kp = fget("put_strike")
-                p  = fget("put_premium")
+                p = fget("put_premium")
 
                 total_premium = c + p
                 step = 0.01  # your updated step
@@ -244,8 +247,8 @@ def _make_payoff_figure(inp: OptionInputs):
 
     # Legs and combined payoff (at expiration)
     call_leg = np.maximum(0.0, S - inp.call_strike) - inp.call_premium
-    put_leg  = np.maximum(0.0, inp.put_strike - S) - inp.put_premium
-    payoff   = call_leg + put_leg
+    put_leg = np.maximum(0.0, inp.put_strike - S) - inp.put_premium
+    payoff = call_leg + put_leg
 
     # Combined-strategy break-evens
     total_premium = inp.call_premium + inp.put_premium
@@ -254,7 +257,7 @@ def _make_payoff_figure(inp: OptionInputs):
 
     # Per-leg break-evens (where each individual option crosses 0 P/L)
     call_be = inp.call_strike + inp.call_premium
-    put_be  = inp.put_strike - inp.put_premium
+    put_be = inp.put_strike - inp.put_premium
 
     p = figure(
         title=f"{inp.ticker} Payoff (Strangle/Straddle)",
@@ -271,7 +274,7 @@ def _make_payoff_figure(inp: OptionInputs):
 
     # Force x-axis to exactly match price_min/price_max
     p.x_range.start = inp.price_min
-    p.x_range.end   = inp.price_max
+    p.x_range.end = inp.price_max
 
     from bokeh.models import (
         Label,
@@ -479,7 +482,6 @@ def _make_payoff_figure(inp: OptionInputs):
     return p
 
 
-
 def _fallback_compute_strangle(inp: OptionInputs):
     S = np.arange(inp.price_min, inp.price_max + inp.step, inp.step)
     call_leg = np.maximum(0.0, S - inp.call_strike) - inp.call_premium
@@ -553,7 +555,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Trading Tools Launcher")
-        self.geometry("700x420")
+        self.geometry("900x480")
 
         # Top header
         top = ttk.Frame(self)
@@ -586,11 +588,33 @@ class App(tk.Tk):
         )
         self.btn_vol_schwab.pack(side=tk.LEFT, padx=6)
 
-        # Status + log
+        # NEW: Schwab Vol Scanner (batched)
+        self.btn_vol_schwab_batch = ttk.Button(
+            btns,
+            text="Schwab Vol Scan (Batched)",
+            command=self._on_run_vol_scanner_schwab_batches,
+        )
+        self.btn_vol_schwab_batch.pack(side=tk.LEFT, padx=6)
+
+        # Stop button for batched Schwab Vol Scanner
+        self.btn_vol_schwab_batch_stop = ttk.Button(
+            btns,
+            text="Stop Batch",
+            command=self._on_stop_vol_scanner_schwab_batches,
+            state=tk.DISABLED,
+        )
+        self.btn_vol_schwab_batch_stop.pack(side=tk.LEFT, padx=6)
+
+        # Status + progress + log
         self.status = tk.StringVar(value="Idle")
         ttk.Label(self, textvariable=self.status, anchor="w").pack(
-            fill=tk.X, padx=12, pady=(0, 10)
+            fill=tk.X, padx=12, pady=(0, 4)
         )
+
+        self.progress = ttk.Progressbar(self, mode="determinate")
+        self.progress.pack(fill=tk.X, padx=12, pady=(0, 8))
+        self.progress["value"] = 0
+        self.progress["maximum"] = 1
 
         self.log = ScrolledText(self, height=10, state="normal")
         self.log.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
@@ -601,13 +625,40 @@ class App(tk.Tk):
         except Exception:
             pass
 
+        # Control flag for batched Schwab Vol Scanner
+        self._stop_schwab_batch = False
+
         self._log("Ready.")
 
     # --- helpers ---
     def _log(self, msg: str):
-        self.log.insert(tk.END, msg + "\n")
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d__%H:%M:%S")
+        line = f"[{ts}] {msg}"
+
+        self.log.insert(tk.END, line + "\n")
         self.log.see(tk.END)
+
+        # Status bar shows only the message
         self.status.set(msg)
+
+    def _update_progress(self, current: int, total: int, ticker: str | None = None):
+        """
+        Update the determinate progress bar.
+        Called from worker threads via self.after() for thread safety.
+        """
+        def do_update():
+            if total <= 0:
+                self.progress["maximum"] = 1
+                self.progress["value"] = 0
+                return
+            self.progress["maximum"] = total
+            self.progress["value"] = min(max(current, 0), total)
+
+        self.after(0, do_update)
+
+    def _reset_progress(self):
+        self._update_progress(0, 1, None)
 
     def _run_bg(self, target, *args, **kwargs):
         t = threading.Thread(target=target, args=args, kwargs=kwargs, daemon=True)
@@ -849,6 +900,7 @@ class App(tk.Tk):
         """
         self._log("Starting Vol Scanner…")
         self.btn_vol.config(state=tk.DISABLED)
+        self._reset_progress()
 
         def job():
             try:
@@ -867,7 +919,8 @@ class App(tk.Tk):
                     import pandas as pd
                     df_all = pd.read_csv(csv_path)
                     if "Ticker" in df_all.columns:
-                        tickers = sorted(df_all["Ticker"].dropna().unique().tolist())
+                        raw_tickers = df_all["Ticker"].dropna().unique().tolist()
+                        tickers = sorted({str(t).strip().upper() for t in raw_tickers if str(t).strip()})
                         self._log(f"Found {len(tickers)} ticker(s) in CSV: {tickers}")
                     else:
                         self._log("No 'Ticker' column in CSV — using default tickers list.")
@@ -876,15 +929,33 @@ class App(tk.Tk):
                     self._log(f"Could not parse CSV to detect tickers: {e}")
                     tickers = ["NVDA", "AAPL", "MSFT"]
 
-                self._log(f"Scanning {len(tickers)} tickers for volatility patterns…")
-                df = vol_mod.build_vol_table_df(tickers, preset="15%", csv_file=csv_path)
+                total = len(tickers)
+                if total == 0:
+                    self._log("No valid tickers detected for Vol Scanner.")
+                    return
+
+                self._log(f"Scanning {total} ticker(s) for volatility patterns…")
+                df = vol_mod.build_vol_table_df(
+                    tickers,
+                    preset="15%",
+                    csv_file=csv_path,
+                    log_fn=self._log,
+                    total_count=total,
+                    completed_so_far=0,
+                    progress_cb=self._update_progress,
+                )
 
                 if df.empty:
                     self._log("No data found for volatility scan.")
                     return
 
                 self._log("Rendering volatility table to HTML…")
-                outfile = vol_mod.render_vol_table_html(df, outfile="vol_scanner_summary.html")
+                outfile = vol_mod.render_vol_table_html(
+                    df,
+                    outfile="vol_scanner_summary.html",
+                    title="Indicator Summary",
+                    log_fn=self._log,
+                )
                 self._log(f"Vol scanner output: {outfile}")
 
                 url = f"file:///{os.path.abspath(outfile)}"
@@ -901,6 +972,7 @@ class App(tk.Tk):
                 messagebox.showerror("Vol Scanner Error", str(e))
             finally:
                 self.btn_vol.config(state=tk.NORMAL)
+                self._reset_progress()
                 self._log("Vol Scanner task finished.")
 
         self._run_bg(job)
@@ -912,6 +984,7 @@ class App(tk.Tk):
         """
         self._log("Starting Schwab Vol Scanner…")
         self.btn_vol_schwab.config(state=tk.DISABLED)
+        self._reset_progress()
 
         def job():
             try:
@@ -943,7 +1016,8 @@ class App(tk.Tk):
                     )
                     return
 
-                self._log(f"[Schwab] Fetching OHLCV for {len(tickers)} ticker(s)…")
+                total = len(tickers)
+                self._log(f"[Schwab] Fetching OHLCV for {total} ticker(s)…")
                 df = fetch_ohlcv_for_tickers(tickers, lookback_days=260)
                 if df.empty:
                     self._log("[Schwab] No data returned from Schwab.")
@@ -968,6 +1042,10 @@ class App(tk.Tk):
                     tickers,
                     preset="15%",
                     csv_file=csv_path,
+                    log_fn=self._log,
+                    total_count=total,
+                    completed_so_far=0,
+                    progress_cb=self._update_progress,
                 )
                 if vol_df.empty:
                     self._log("Vol scanner returned no rows.")
@@ -982,6 +1060,7 @@ class App(tk.Tk):
                     vol_df,
                     outfile="vol_scanner_from_schwab.html",
                     title="Vol Scanner (Schwab Data)",
+                    log_fn=self._log,
                 )
 
                 self._log(f"Schwab Vol scanner output: {outfile}")
@@ -996,7 +1075,285 @@ class App(tk.Tk):
                 messagebox.showerror("Schwab Vol Scanner Error", str(e))
             finally:
                 self.btn_vol_schwab.config(state=tk.NORMAL)
+                self._reset_progress()
                 self._log("Schwab Vol Scanner task finished.")
+
+        self._run_bg(job)
+
+    def _on_stop_vol_scanner_schwab_batches(self):
+        """
+        Handler for the Stop Batch button.
+        """
+        self._log("[Schwab Batch] Stop requested by user.")
+        self._stop_schwab_batch = True
+
+    def _on_run_vol_scanner_schwab_batches(self):
+        """
+        Fetch OHLCV from Schwab in batches of N tickers every M minutes,
+        updating vol_scanner_from_schwab.html each time, until all tickers are processed
+        or the user presses Stop Batch.
+
+        Enforces a max request rate of 1 ticker per second:
+            batch_size / (interval_minutes * 60) <= 1
+        """
+        self._log("Starting Schwab Vol Scanner (batched)…")
+        self.btn_vol_schwab_batch.config(state=tk.DISABLED)
+        self.btn_vol_schwab_batch_stop.config(state=tk.NORMAL)
+        self._stop_schwab_batch = False  # reset stop flag at start
+        self._reset_progress()
+
+        # --- Ask user for batch size ---
+        batch_size = simpledialog.askinteger(
+            "Batch Size",
+            "How many tickers per batch?\n(Recommended ≤ 50)",
+            initialvalue=50,
+            minvalue=1,
+            parent=self,
+        )
+        if batch_size is None:
+            # user cancelled dialog
+            self._log("[Schwab Batch] Cancelled — no batch size entered.")
+            self.btn_vol_schwab_batch.config(state=tk.NORMAL)
+            self.btn_vol_schwab_batch_stop.config(state=tk.DISABLED)
+            self._stop_schwab_batch = False
+            self._reset_progress()
+            return
+
+        # --- Ask user for interval between batches (in minutes) ---
+        interval_minutes = simpledialog.askinteger(
+            "Batch Interval",
+            "How many minutes between batches?",
+            initialvalue=2,
+            minvalue=1,
+            parent=self,
+        )
+        if interval_minutes is None:
+            self._log("[Schwab Batch] Cancelled — no interval entered.")
+            self.btn_vol_schwab_batch.config(state=tk.NORMAL)
+            self.btn_vol_schwab_batch_stop.config(state=tk.DISABLED)
+            self._stop_schwab_batch = False
+            self._reset_progress()
+            return
+
+        interval_seconds = interval_minutes * 60
+
+        # --- Rate limit check: max 1 ticker per second ---
+        rate = batch_size / interval_seconds  # tickers per second
+        if rate > 1.0:
+            msg = (
+                "Request rate too high:\n\n"
+                f"{batch_size} tickers every {interval_seconds} seconds "
+                f"= {rate:.2f} tickers/second.\n\n"
+                "Please choose a combination\n"
+                "with ≤ 1 ticker per second."
+            )
+            self._log("[Schwab Batch] " + msg.replace("\n", " "))
+            messagebox.showerror("Rate Limit Exceeded", msg)
+            self.btn_vol_schwab_batch.config(state=tk.NORMAL)
+            self.btn_vol_schwab_batch_stop.config(state=tk.DISABLED)
+            self._stop_schwab_batch = False
+            self._reset_progress()
+            return
+
+        def job():
+            try:
+                try:
+                    from schwab_vol_scan_prep import fetch_ohlcv_for_tickers
+                except ImportError as e:
+                    self._log(f"[Schwab Batch] Could not import schwab_vol_scan_prep: {e}")
+                    messagebox.showerror(
+                        "Missing module",
+                        "schwab_vol_scan_prep.py not found or import failed.\n"
+                        "Make sure you've added it to the project.",
+                    )
+                    return
+
+                # If user hit Stop before file dialog finishes, respect it
+                if self._stop_schwab_batch:
+                    self._log("[Schwab Batch] Stop flag set before selecting ticker file.")
+                    return
+
+                ticker_file = filedialog.askopenfilename(
+                    title="Select text file with tickers (one per line)",
+                    filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+                )
+                if not ticker_file:
+                    self._log("[Schwab Batch] Cancelled — no tickers file selected.")
+                    return
+
+                tickers = _ticker_list_from_file(ticker_file)
+                if not tickers:
+                    self._log("[Schwab Batch] Ticker file was empty or only comments.")
+                    messagebox.showwarning(
+                        "No tickers",
+                        "No valid tickers found in the selected file.",
+                    )
+                    return
+
+                total = len(tickers)
+                self._log(
+                    f"[Schwab Batch] Loaded {total} ticker(s) from file. "
+                    f"Batch size={batch_size}, interval={interval_minutes} min "
+                    f"({interval_seconds}s, {rate:.2f} tickers/sec)."
+                )
+
+                vol_mod = _load_vol_scan_module(self._log)
+
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+                csv_dir = os.path.join(base_dir, "csv_html")
+                os.makedirs(csv_dir, exist_ok=True)
+
+                csv_path = os.path.join(csv_dir, "schwab_ohlcv_gui.csv")
+                html_outfile = "vol_scanner_from_schwab.html"
+
+                import pandas as pd
+                all_results_df = None
+
+                # initialize progress
+                self._update_progress(0, total, None)
+
+                for start in range(0, total, batch_size):
+                    if self._stop_schwab_batch:
+                        self._log("[Schwab Batch] Stop flag set — exiting batch loop.")
+                        break
+
+                    batch = tickers[start:start + batch_size]
+                    batch_idx_start = start + 1
+                    batch_idx_end = start + len(batch)
+
+                    self._log(
+                        f"[Schwab Batch] Processing tickers {batch_idx_start}-{batch_idx_end} "
+                        f"of {total}: {batch}"
+                    )
+
+                    # 1) Fetch OHLCV for this batch
+                    try:
+                        df_ohlcv = fetch_ohlcv_for_tickers(batch, lookback_days=260)
+                    except Exception as e:
+                        self._log(
+                            f"[Schwab Batch] ERROR fetching OHLCV for batch {batch}: {e}"
+                        )
+                        self._log(traceback.format_exc())
+                        break
+
+                    if df_ohlcv is None or df_ohlcv.empty:
+                        self._log(
+                            f"[Schwab Batch] No data returned from Schwab for batch {batch}."
+                        )
+                        # still move progress forward based on number of tickers in this batch
+                        self._update_progress(batch_idx_end, total, None)
+                        continue
+
+                    # 2) Write batch OHLCV to CSV
+                    try:
+                        df_ohlcv.to_csv(csv_path, index=False)
+                        self._log(
+                            f"[Schwab Batch] Wrote OHLCV CSV for batch to: {csv_path}"
+                        )
+                    except Exception as e:
+                        self._log(
+                            f"[Schwab Batch] ERROR writing CSV for batch: {e}"
+                        )
+                        self._log(traceback.format_exc())
+                        break
+
+                    if self._stop_schwab_batch:
+                        self._log(
+                            "[Schwab Batch] Stop flag set after CSV write — exiting loop."
+                        )
+                        break
+
+                    # 3) Build vol scan table for this batch,
+                    #    with global progress information
+                    try:
+                        vol_df = vol_mod.build_vol_table_df(
+                            batch,
+                            preset="15%",
+                            csv_file=csv_path,
+                            log_fn=self._log,
+                            total_count=total,
+                            completed_so_far=start,
+                            progress_cb=self._update_progress,
+                        )
+                    except Exception as e:
+                        self._log(
+                            f"[Schwab Batch] ERROR building vol table for batch: {e}"
+                        )
+                        self._log(traceback.format_exc())
+                        break
+
+                    if vol_df is None or vol_df.empty:
+                        self._log(
+                            f"[Schwab Batch] Vol scanner returned no rows for batch {batch}."
+                        )
+                        # progress callback already updated during build_vol_table_df
+                        continue
+
+                    # 4) Merge into cumulative results
+                    if all_results_df is None:
+                        all_results_df = vol_df.copy()
+                    else:
+                        all_results_df = pd.concat(
+                            [all_results_df, vol_df],
+                            ignore_index=True,
+                        )
+                        all_results_df = all_results_df.drop_duplicates(
+                            subset=["Ticker"], keep="last"
+                        ).reset_index(drop=True)
+
+                    if self._stop_schwab_batch:
+                        self._log(
+                            "[Schwab Batch] Stop flag set before HTML render — exiting loop."
+                        )
+                        break
+
+                    # 5) Render HTML using ALL results so far
+                    try:
+                        outfile = vol_mod.render_vol_table_html(
+                            all_results_df,
+                            outfile=html_outfile,
+                            title="Vol Scanner (Schwab Data - Batched)",
+                            log_fn=self._log,
+                        )
+                        self._log(f"[Schwab Batch] Updated HTML: {outfile}")
+                        if start == 0:
+                            url = f"file:///{os.path.abspath(outfile)}"
+                            if not _open_in_chrome(url):
+                                webbrowser.open(url)
+                    except Exception as e:
+                        self._log(f"[Schwab Batch] ERROR rendering HTML: {e}")
+                        self._log(traceback.format_exc())
+                        break
+
+                    # 6) Sleep before next batch (if any)
+                    if batch_idx_end < total:
+                        self._log(
+                            f"[Schwab Batch] Sleeping {interval_seconds} seconds "
+                            "before next batch…"
+                        )
+                        for _ in range(interval_seconds):
+                            if self._stop_schwab_batch:
+                                self._log(
+                                    "[Schwab Batch] Stop flag set during sleep — exiting loop."
+                                )
+                                break
+                            time.sleep(1)
+                        if self._stop_schwab_batch:
+                            break
+
+                self._log("[Schwab Batch] Batch processing finished.")
+
+            except Exception as e:
+                self._log(f"[Schwab Batch] FATAL ERROR: {e}")
+                self._log(traceback.format_exc())
+                messagebox.showerror("Schwab Vol Scanner (Batched) Error", str(e))
+            finally:
+                # Re-enable/disable buttons and reset flag
+                self.btn_vol_schwab_batch.config(state=tk.NORMAL)
+                self.btn_vol_schwab_batch_stop.config(state=tk.DISABLED)
+                self._stop_schwab_batch = False
+                self._reset_progress()
+                self._log("Schwab Vol Scanner (Batched) task finished.")
 
         self._run_bg(job)
 
