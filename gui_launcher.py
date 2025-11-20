@@ -6,6 +6,8 @@ import tempfile
 import webbrowser
 import importlib
 import shutil
+import csv
+
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -242,13 +244,29 @@ def _make_payoff_figure(inp: OptionInputs):
     if np is None:
         raise RuntimeError("Missing dependencies. Install with: pip install bokeh numpy")
 
+
     # Price grid
     S = np.arange(inp.price_min, inp.price_max + inp.step, inp.step)
 
+    # What kind of position is this?
+    strategy = getattr(inp, "strategy", "strangle").lower()
+
     # Legs and combined payoff (at expiration)
-    call_leg = np.maximum(0.0, S - inp.call_strike) - inp.call_premium
-    put_leg = np.maximum(0.0, inp.put_strike - S) - inp.put_premium
+    if strategy == "call":
+        # Call-only
+        call_leg = np.maximum(0.0, S - inp.call_strike) - inp.call_premium
+        put_leg  = np.zeros_like(S)
+    elif strategy == "put":
+        # Put-only
+        call_leg = np.zeros_like(S)
+        put_leg  = np.maximum(0.0, inp.put_strike - S) - inp.put_premium
+    else:
+        # Straddle / Strangle: both legs
+        call_leg = np.maximum(0.0, S - inp.call_strike) - inp.call_premium
+        put_leg  = np.maximum(0.0, inp.put_strike - S) - inp.put_premium
+
     payoff = call_leg + put_leg
+
 
     # Combined-strategy break-evens
     total_premium = inp.call_premium + inp.put_premium
@@ -306,11 +324,15 @@ def _make_payoff_figure(inp: OptionInputs):
         alpha=0.0,
     )
 
-    # Individual legs (helps explain the shape)
-    p.line(S, call_leg, line_width=1, line_dash="dashed", alpha=0.7,
-           legend_label="Call leg")
-    p.line(S, put_leg, line_width=1, line_dash="dotted", alpha=0.7,
-           legend_label="Put leg")
+
+    # Individual legs (helps explain the shape) – only draw if non-zero
+    if not np.allclose(call_leg, 0.0):
+        p.line(S, call_leg, line_width=1, line_dash="dashed", alpha=0.7,
+               legend_label="Call leg")
+    if not np.allclose(put_leg, 0.0):
+        p.line(S, put_leg, line_width=1, line_dash="dotted", alpha=0.7,
+               legend_label="Put leg")
+
 
     # Zero P/L line
     p.add_layout(Span(location=0, dimension='width', line_color='gray',
@@ -548,6 +570,353 @@ def plot_option_payoff_using_your_code(inp: OptionInputs, log_fn=print):
     return _fallback_plot(inp, log_fn)
 
 
+class CSVEditorDialog(tk.Toplevel):
+    """
+    Simple popup editor for the options_input CSV.
+
+    - Shows rows in a Treeview.
+    - Lets you edit the selected row via form fields.
+    - Lets you add new rows for straight CALL and straight PUT.
+    - Greys out unneeded inputs (call fields for PUT, put fields for CALL).
+    - When OK is pressed, self.result is a list of row dicts compatible
+      with the original CSV columns.
+    """
+    def __init__(self, parent, rows):
+        super().__init__(parent)
+        self.title("Edit Options Input")
+        self.transient(parent)
+        self.grab_set()
+
+        self.rows = [dict(r) for r in rows]  # copy
+        self.selected_index = None
+        self.result = None  # will hold edited rows on OK
+
+        # --- main layout ---
+        main = ttk.Frame(self)
+        main.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        # Treeview
+        self.tree = ttk.Treeview(
+            main,
+            columns=("strategy", "ticker", "call_strike", "call_premium",
+                     "put_strike", "put_premium"),
+            show="headings",
+            height=8,
+        )
+        for col, text, width in [
+            ("strategy", "Strategy", 90),
+            ("ticker", "Ticker", 80),
+            ("call_strike", "Call K", 80),
+            ("call_premium", "Call Prem", 90),
+            ("put_strike", "Put K", 80),
+            ("put_premium", "Put Prem", 90),
+        ]:
+            self.tree.heading(col, text=text)
+            self.tree.column(col, width=width, anchor="center")
+
+        self.tree.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        # Form for selected row
+        form = ttk.Frame(main)
+        form.pack(side=tk.TOP, fill=tk.X, pady=(6, 4))
+
+        ttk.Label(form, text="Strategy:").grid(row=0, column=0, sticky="e", padx=3, pady=2)
+        self.var_strategy = tk.StringVar()
+        self.cbo_strategy = ttk.Combobox(
+            form,
+            textvariable=self.var_strategy,
+            values=("straddle", "strangle", "call", "put"),
+            state="readonly",
+            width=10,
+        )
+        self.cbo_strategy.grid(row=0, column=1, sticky="w", padx=3, pady=2)
+        self.cbo_strategy.bind("<<ComboboxSelected>>", self._on_strategy_change)
+
+        ttk.Label(form, text="Ticker:").grid(row=0, column=2, sticky="e", padx=3, pady=2)
+        self.var_ticker = tk.StringVar()
+        ttk.Entry(form, textvariable=self.var_ticker, width=10)\
+            .grid(row=0, column=3, sticky="w", padx=3, pady=2)
+
+        ttk.Label(form, text="Call K:").grid(row=1, column=0, sticky="e", padx=3, pady=2)
+        self.var_call_k = tk.StringVar()
+        self.ent_call_k = ttk.Entry(form, textvariable=self.var_call_k, width=10)
+        self.ent_call_k.grid(row=1, column=1, sticky="w", padx=3, pady=2)
+
+        ttk.Label(form, text="Call Prem:").grid(row=1, column=2, sticky="e", padx=3, pady=2)
+        self.var_call_p = tk.StringVar()
+        self.ent_call_p = ttk.Entry(form, textvariable=self.var_call_p, width=10)
+        self.ent_call_p.grid(row=1, column=3, sticky="w", padx=3, pady=2)
+
+        ttk.Label(form, text="Put K:").grid(row=2, column=0, sticky="e", padx=3, pady=2)
+        self.var_put_k = tk.StringVar()
+        self.ent_put_k = ttk.Entry(form, textvariable=self.var_put_k, width=10)
+        self.ent_put_k.grid(row=2, column=1, sticky="w", padx=3, pady=2)
+
+        ttk.Label(form, text="Put Prem:").grid(row=2, column=2, sticky="e", padx=3, pady=2)
+        self.var_put_p = tk.StringVar()
+        self.ent_put_p = ttk.Entry(form, textvariable=self.var_put_p, width=10)
+        self.ent_put_p.grid(row=2, column=3, sticky="w", padx=3, pady=2)
+
+        # Buttons row (update / add / delete)
+        btns_row = ttk.Frame(main)
+        btns_row.pack(side=tk.TOP, fill=tk.X, pady=(4, 4))
+
+        ttk.Button(btns_row, text="Update Selected Row",
+                   command=self._on_update_row)\
+            .pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns_row, text="Add CALL Row",
+                   command=self._on_add_call)\
+            .pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns_row, text="Add PUT Row",
+                   command=self._on_add_put)\
+            .pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns_row, text="Delete Selected",
+                   command=self._on_delete_selected)\
+            .pack(side=tk.LEFT, padx=4)
+
+        # OK / Cancel
+        bottom = ttk.Frame(main)
+        bottom.pack(side=tk.TOP, fill=tk.X, pady=(6, 0))
+        bottom.columnconfigure(0, weight=1)
+
+        ttk.Button(bottom, text="OK", command=self._on_ok)\
+            .grid(row=0, column=0, sticky="e", padx=4)
+        ttk.Button(bottom, text="Cancel", command=self._on_cancel)\
+            .grid(row=0, column=1, sticky="w", padx=4)
+
+        # Populate tree
+        self._refresh_tree()
+        if self.rows:
+            self.tree.selection_set(self.tree.get_children()[0])
+            self._on_select(None)
+
+        self.resizable(True, True)
+
+    # ------------- helpers -------------
+
+    def _refresh_tree(self):
+        # Clear
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+        # Re-insert
+        for idx, r in enumerate(self.rows):
+            self.tree.insert(
+                "",
+                tk.END,
+                iid=str(idx),
+                values=(
+                    r.get("strategy", ""),
+                    r.get("ticker", ""),
+                    r.get("call_strike", ""),
+                    r.get("call_premium", ""),
+                    r.get("put_strike", ""),
+                    r.get("put_premium", ""),
+                ),
+            )
+
+    def _on_select(self, event):
+        sel = self.tree.selection()
+        if not sel:
+            self.selected_index = None
+            return
+        idx = int(sel[0])
+        self.selected_index = idx
+        r = self.rows[idx]
+
+        self.var_strategy.set((r.get("strategy") or "straddle").lower())
+        self.var_ticker.set(r.get("ticker", ""))
+
+        self.var_call_k.set(str(r.get("call_strike", "")))
+        self.var_call_p.set(str(r.get("call_premium", "")))
+        self.var_put_k.set(str(r.get("put_strike", "")))
+        self.var_put_p.set(str(r.get("put_premium", "")))
+
+        self._apply_strategy_disable()
+
+    def _on_strategy_change(self, event=None):
+        self._apply_strategy_disable()
+
+    def _apply_strategy_disable(self):
+        strat = (self.var_strategy.get() or "").lower()
+        # default: enable all
+        for ent in (self.ent_call_k, self.ent_call_p,
+                    self.ent_put_k, self.ent_put_p):
+            ent.configure(state="normal")
+
+        if strat == "call":
+            # call-only: disable put fields
+            self.ent_put_k.configure(state="disabled")
+            self.ent_put_p.configure(state="disabled")
+        elif strat == "put":
+            # put-only: disable call fields
+            self.ent_call_k.configure(state="disabled")
+            self.ent_call_p.configure(state="disabled")
+        # straddle/strangle: all enabled
+
+    def _on_update_row(self):
+        if self.selected_index is None:
+            messagebox.showwarning("No selection", "Select a row to update.")
+            return
+
+        idx = self.selected_index
+        strat = (self.var_strategy.get() or "straddle").lower()
+
+        r = {
+            "strategy": strat,
+            "ticker": self.var_ticker.get().strip().upper(),
+            "call_strike": self.var_call_k.get().strip(),
+            "call_premium": self.var_call_p.get().strip(),
+            "put_strike": self.var_put_k.get().strip(),
+            "put_premium": self.var_put_p.get().strip(),
+        }
+
+        self.rows[idx] = r
+        self._refresh_tree()
+        self.tree.selection_set(str(idx))
+
+    def _on_add_call(self):
+        r = {
+            "strategy": "call",
+            "ticker": "",
+            "call_strike": "",
+            "call_premium": "",
+            "put_strike": "",
+            "put_premium": "",
+        }
+        self.rows.append(r)
+        self._refresh_tree()
+        new_idx = len(self.rows) - 1
+        self.tree.selection_set(str(new_idx))
+        self._on_select(None)
+
+    def _on_add_put(self):
+        r = {
+            "strategy": "put",
+            "ticker": "",
+            "call_strike": "",
+            "call_premium": "",
+            "put_strike": "",
+            "put_premium": "",
+        }
+        self.rows.append(r)
+        self._refresh_tree()
+        new_idx = len(self.rows) - 1
+        self.tree.selection_set(str(new_idx))
+        self._on_select(None)
+
+    def _on_delete_selected(self):
+        if self.selected_index is None:
+            return
+        idx = self.selected_index
+        del self.rows[idx]
+        self.selected_index = None
+        self._refresh_tree()
+        # select first row if any
+        kids = self.tree.get_children()
+        if kids:
+            self.tree.selection_set(kids[0])
+            self._on_select(None)
+
+    def _on_ok(self):
+        self.result = self.rows
+        self.destroy()
+
+    def _on_cancel(self):
+        self.result = None
+        self.destroy()
+
+
+def option_inputs_from_rows(rows):
+    """
+    Convert edited CSV rows (dicts) into a list of OptionInputs.
+
+    Supports strategies:
+      - straddle
+      - strangle
+      - call  (single-leg call)
+      - put   (single-leg put)
+
+    For single-leg rows, the "other" leg is set to 0 so the existing
+    payoff code still works, but effectively only the chosen leg has
+    non-zero payoff.
+    """
+    result = []
+
+    for i, r in enumerate(rows, start=1):
+        try:
+            strategy = (r.get("strategy") or "straddle").strip().lower()
+            ticker = (r.get("ticker") or "TICKER").strip().upper()
+
+            def f(k):
+                v = (r.get(k, "") or "").strip()
+                return float(v) if v != "" else 0.0
+
+            kc = f("call_strike")
+            c  = f("call_premium")
+            kp = f("put_strike")
+            p  = f("put_premium")
+
+            if strategy == "call":
+                # Call-only: need a call strike
+                if kc == 0.0:
+                    raise ValueError("Call K missing")
+                # If no explicit put strike, just mirror call strike (won't be used)
+                if kp == 0.0:
+                    kp = kc
+            elif strategy == "put":
+                # Put-only: need a put strike
+                if kp == 0.0:
+                    raise ValueError("Put K missing")
+                # If no explicit call strike, just mirror put strike (won't be used)
+                if kc == 0.0:
+                    kc = kp
+            elif strategy == "straddle":
+                # standard straddle: both legs at same strike
+                if kc == 0.0:
+                    raise ValueError("Call K missing for straddle")
+                kp = kc
+            elif strategy == "strangle":
+                # require both strikes
+                if kc == 0.0 or kp == 0.0:
+                    raise ValueError("Both strikes needed for strangle")
+            else:
+                raise ValueError(f"Unknown strategy '{strategy}'")
+
+            total_premium = c + p
+            step = 0.01
+
+            if strategy in ("straddle", "call", "put"):
+                price_min = kc - 3.0 * total_premium
+                price_max = kc + 3.0 * total_premium
+            else:  # strangle
+                price_min = kp - 3.0 * total_premium
+                price_max = kc + 3.0 * total_premium
+
+            # Basic sanity
+            if price_max <= price_min:
+                price_max = price_min + 1.0
+
+            opt = OptionInputs(
+                ticker=ticker,
+                spot=0.0,  # will be filled in from Schwab later
+                call_strike=kc,
+                call_premium=c,
+                put_strike=kp,
+                put_premium=p,
+                price_min=price_min,
+                price_max=price_max,
+                step=step,
+            )
+            # Tag with strategy so the plotter knows what to show
+            setattr(opt, "strategy", strategy)
+            result.append(opt)
+        except Exception as e:
+            raise ValueError(f"Error in row {i}: {e}") from e
+
+    return result
+
+
 # ----------------------------
 # Tkinter App
 # ----------------------------
@@ -571,7 +940,7 @@ class App(tk.Tk):
         self.btn_ind.pack(side=tk.LEFT, padx=6)
 
         # Button for CSV-based payoff plotting
-        self.btn_csv = ttk.Button(btns, text="Strat/Strang Plot (CSV)",
+        self.btn_csv = ttk.Button(btns, text="Option Plot (CSV)",
                                   command=self._on_plot_from_csv)
         self.btn_csv.pack(side=tk.LEFT, padx=6)
 
@@ -759,6 +1128,14 @@ class App(tk.Tk):
 
     # --- button handlers ---
     def _on_plot_from_csv(self):
+        """
+        1) Ask user for an options_input.csv.
+        2) Show an editable popup table (CSVEditorDialog) where they can:
+           - tweak existing rows
+           - add straight CALL / PUT rows (with unneeded inputs greyed out)
+        3) Save the edited rows back into the same CSV file.
+        4) Use the edited rows as the input for payoff plotting.
+        """
         path = filedialog.askopenfilename(
             title="Select options_input.csv",
             filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
@@ -766,14 +1143,71 @@ class App(tk.Tk):
         if not path:
             return
 
+        # --- Load CSV as rows of dicts ---
         try:
-            inputs_list = read_option_inputs_csv(path)
+            with open(path, newline="", encoding="utf-8-sig") as f:
+                rdr = csv.DictReader(f)
+                fieldnames = rdr.fieldnames[:] if rdr.fieldnames else None
+                rows = list(rdr)
         except Exception as e:
-            messagebox.showerror("CSV Error", str(e))
+            messagebox.showerror("CSV Error", f"Failed to read CSV:\n{e}")
+            return
+
+        if not rows:
+            messagebox.showinfo("No rows", "CSV has no data rows.")
+            return
+
+        # --- Show editor popup ---
+        dlg = CSVEditorDialog(self, rows)
+        self.wait_window(dlg)
+
+        if dlg.result is None:
+            self._log("CSV edit cancelled; no plots generated.")
+            return
+
+        edited_rows = dlg.result
+
+        # --- Save edited rows back to the same CSV file ---
+        required_cols = [
+            "strategy",
+            "ticker",
+            "call_strike",
+            "call_premium",
+            "put_strike",
+            "put_premium",
+        ]
+
+        # If original CSV had no header, create one
+        if not fieldnames:
+            fieldnames = required_cols[:]
+        else:
+            # Make sure required columns exist in header
+            for col in required_cols:
+                if col not in fieldnames:
+                    fieldnames.append(col)
+
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for r in edited_rows:
+                    # Ensure all header fields are present; missing ones become ""
+                    row_out = {fn: r.get(fn, "") for fn in fieldnames}
+                    writer.writerow(row_out)
+            self._log(f"Saved edited input back to CSV: {path}")
+        except Exception as e:
+            messagebox.showerror("Save Error", f"Failed to save edited CSV:\n{e}")
+            return
+
+        # --- Convert edited rows into OptionInputs ---
+        try:
+            inputs_list = option_inputs_from_rows(edited_rows)
+        except Exception as e:
+            messagebox.showerror("Input Error", str(e))
             return
 
         if not inputs_list:
-            messagebox.showinfo("No rows", "CSV has no data rows.")
+            messagebox.showinfo("No rows", "No valid rows after editing.")
             return
 
         # ---------------------------------------------------------
@@ -850,7 +1284,7 @@ class App(tk.Tk):
                 self._log(f"[Schwab] No live price for {inp.ticker}; using fallback spot={inp.spot:.2f}")
                 setattr(inp, "recent_closes", [])
 
-        self._log(f"Loaded {len(inputs_list)} row(s) from CSV. Building combined HTML with tabs…")
+        self._log(f"Loaded {len(inputs_list)} row(s) from edited input. Building combined HTML with tabs…")
         self.btn_csv.config(state=tk.DISABLED)
 
         def job():

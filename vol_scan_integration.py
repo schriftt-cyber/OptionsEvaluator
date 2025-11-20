@@ -691,8 +691,10 @@ def _make_table(df: pd.DataFrame) -> DataTable:
     """
     Build a Bokeh DataTable for the vol scanner.
 
-    Key change: give the table explicit width/height and avoid tricky autosize
-    so it renders reliably inside Tabs.
+    Includes:
+      - RecBadge (colored GO/WATCH/PASS/JUNK)
+      - DaysOnRec (how many calendar days the ticker has been in its current Recommendation)
+      - JunkReason (for JUNK tickers)
     """
     source = ColumnDataSource(df)
 
@@ -708,6 +710,7 @@ def _make_table(df: pd.DataFrame) -> DataTable:
             formatter=HTMLTemplateFormatter(template="<%= value %>"),
             width=120,
         ),
+        TableColumn(field="DaysOnRec", title="Days on Rec", width=90),
         TableColumn(field="WeightedScore", title="Weighted",
                     formatter=NumberFormatter(format="0.00"), width=100),
         TableColumn(field="CategoryActiveCount", title="#Cats", width=70),
@@ -749,23 +752,21 @@ def _make_table(df: pd.DataFrame) -> DataTable:
         TableColumn(field="Put_Rec", title="Put", width=70),
         TableColumn(field="Straddle_Rec", title="Straddle", width=80),
         TableColumn(field="Strangle_Rec", title="Strangle", width=80),
-        # If you added RecDays earlier, it will show up automatically
-        # once you add a TableColumn here, e.g.:
-        # TableColumn(field="RecDays", title="Days on Rec", width=90),
+        TableColumn(field="JunkReason", title="Junk Reason", width=220),
     ]
 
     return DataTable(
         source=source,
         columns=cols,
         index_position=None,
-        width=1500,     # explicit width so it actually shows
-        height=650,     # explicit height
+        width=1600,
+        height=650,
         row_height=28,
         sortable=True,
         selectable=True,
         reorderable=False,
-        # avoid autosize_mode here; it can cause zero-width behavior in some setups
     )
+
 
 
 
@@ -775,27 +776,25 @@ def build_vol_table_df(
     csv_file: str | None = None,
     log_fn=print,
     total_count: int | None = None,
-    completed_so_far: int = 0,
+    completed_so_far: int | None = None,
     progress_cb=None,
 ) -> pd.DataFrame:
     """
     Build the volatility scan table for the given tickers.
 
-    - If csv_file is provided, it's passed via cfg["LOCAL_CSV_PATH"] so _analyze_ticker()
-      loads OHLCV from that CSV instead of yfinance.
-    - Also, if csv_file is provided and has Ticker/Date/Volume, we attach
-      the latest Volume per ticker as 'Vol' for display.
-
-    Progress logging:
-      total_count      = total number of tickers in the overall run (file)
-      completed_so_far = how many tickers have been processed BEFORE this batch
-
-      For each ticker in this batch, we log:
-        [VolScan] TICKER ... Complete (global_index/total_count, XX.X%)
-
-    If progress_cb is provided, it will be called as:
-        progress_cb(global_index, total_count, ticker)
+    - If csv_file is provided, it's passed via cfg["LOCAL_CSV_PATH"] so
+      _analyze_ticker() loads OHLCV from that CSV instead of yfinance.
+    - If csv_file has Ticker/Date/Volume, we attach latest Volume as 'Vol'.
+    - Any ticker that fails analysis or has no data is added as a JUNK row
+      with a JunkReason explaining why.
+    - total_count + completed_so_far + progress_cb are optional and used
+      to report overall progress back to the caller (GUI).
+        * progress_cb(current_completed, total_count)
+    - Also maintains a vol_scan_history.csv in csv_html/ and computes
+      DaysOnRec (days the ticker has stayed in its current Recommendation).
     """
+    import datetime as dt
+
     cfg = DEFAULTS.copy()
     if "30" in str(preset):
         cfg.update(EXPLOSIVE_OVERRIDES)
@@ -803,55 +802,94 @@ def build_vol_table_df(
     if csv_file:
         cfg["LOCAL_CSV_PATH"] = csv_file
 
-    # Normalize and filter tickers
-    norm_tickers = []
+    rows: list[dict] = []
+    junk_rows: list[dict] = []
+
+    # For progress across batches
+    base_completed = completed_so_far or 0
+    processed_in_this_call = 0
+
     for t in tickers:
-        if t is None:
-            continue
-        t_sym = str(t).strip().upper()
+        t_sym = t.strip().upper()
         if not t_sym:
             continue
-        norm_tickers.append(t_sym)
 
-    batch_size = len(norm_tickers)
-    if batch_size == 0:
-        log_fn("[VolScan] No valid tickers provided.")
-        return pd.DataFrame()
+        processed_in_this_call += 1
 
-    # If caller didn't pass a total_count, assume this batch IS the total.
-    if total_count is None or total_count <= 0:
-        total_count = batch_size
-
-    rows = []
-    for batch_index, t_sym in enumerate(norm_tickers, start=1):
-        global_index = completed_so_far + batch_index
-        pct = (global_index / total_count) * 100.0 if total_count > 0 else 0.0
-
-        result = _analyze_ticker(t_sym, cfg, log_fn=log_fn)
-        if result:
-            rows.append(result)
-            log_fn(
-                f"[VolScan] {t_sym} ... Complete "
-                f"({global_index}/{total_count}, {pct:.1f}%)"
-            )
-        else:
-            log_fn(
-                f"[VolScan] {t_sym} ... Skipped (no data or error) "
-                f"({global_index}/{total_count}, {pct:.1f}%)"
-            )
-
-        if progress_cb is not None:
+        # --- progress callback (overall file progress) ---
+        if progress_cb is not None and total_count is not None and total_count > 0:
             try:
-                progress_cb(global_index, total_count, t_sym)
-            except Exception:
-                # don't let a progress callback crash the scan
-                pass
+                current_completed = base_completed + processed_in_this_call
+                progress_cb(current_completed, total_count)
+            except Exception as e:
+                log_fn(f"[VolScan] WARNING: progress_cb error for {t_sym}: {e}")
 
-    if not rows:
+        junk_reason = None
+        try:
+            result = _analyze_ticker(t_sym, cfg, log_fn=log_fn)
+        except Exception as e:
+            junk_reason = f"error in _analyze_ticker: {e}"
+            log_fn(f"[VolScan] {t_sym} ... ERROR: {e}")
+            result = None
+
+        if result:
+            # Ensure non-junk rows still have a JunkReason column
+            result.setdefault("JunkReason", "")
+            rows.append(result)
+            log_fn(f"[VolScan] {t_sym} ... Complete")
+        else:
+            if junk_reason is None:
+                junk_reason = "no data / filtered out"
+
+            log_fn(f"[VolScan] {t_sym} ... JUNK ({junk_reason})")
+
+            junk_rows.append({
+                "Ticker": t_sym,
+                "Price": np.nan,
+                "WeightedScore": np.nan,
+                "CategoryActiveCount": 0,
+                "CategoryHits_Technical": 0,
+                "CategoryHits_Participation": 0,
+                "CategoryHits_Sentiment": 0,
+                "CategoryHits_Volatility": 0,
+                "Flags": 0,
+                "RVOL": np.nan,
+                "Range_mult_20d": np.nan,
+                "BBWidth_pct_rank": np.nan,
+                "ATR_rising_days": 0,
+                "HV20": np.nan,
+                "HV60": np.nan,
+                "Cross_200DMA": "",
+                "Opt_total_vol": "",
+                "Put_Call": "",
+                "Recommendation": "JUNK",
+                "RecColor": "#777777",   # grey badge
+                "RSI14": np.nan,
+                "RSI2": np.nan,
+                "MACD_hist": np.nan,
+                "ADX": np.nan,
+                "ST_dir": 0,
+                "TrendDir": 0,
+                "BullScore": 0,
+                "BearScore": 0,
+                "StraddleCost": "",
+                "ExpectedMove": "",
+                "EV_ratio": "",
+                "Call_Rec": "",
+                "Put_Rec": "",
+                "Straddle_Rec": "",
+                "Strangle_Rec": "",
+                "JunkReason": junk_reason,
+            })
+
+    if not rows and not junk_rows:
         log_fn("[VolScan] No tickers produced results.")
         return pd.DataFrame()
 
-    df = pd.DataFrame(rows)
+    # ------------------------
+    # Combine good + junk rows
+    # ------------------------
+    df = pd.DataFrame(rows + junk_rows)
 
     # Attach latest daily Volume per ticker as 'Vol' if we have a Schwab CSV
     if csv_file:
@@ -867,10 +905,7 @@ def build_vol_table_df(
                 )
                 df = df.merge(last_by_ticker, on="Ticker", how="left")
             else:
-                log_fn(
-                    "[VolScan] WARNING: CSV missing Ticker/Date/Volume; "
-                    "cannot attach Vol column"
-                )
+                log_fn("[VolScan] WARNING: CSV missing Ticker/Date/Volume; cannot attach Vol column")
                 df["Vol"] = pd.NA
         except Exception as e:
             log_fn(f"[VolScan] WARNING: Failed to attach Vol from {csv_file}: {e}")
@@ -878,7 +913,87 @@ def build_vol_table_df(
     else:
         df["Vol"] = pd.NA
 
-    # Prebuild badge HTML so the DataTable template can safely use <%= value %>
+    # -------------------------------------------------
+    # Maintain vol_scan_history.csv and compute DaysOnRec
+    # -------------------------------------------------
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    html_dir = os.path.join(base_dir, "csv_html")
+    os.makedirs(html_dir, exist_ok=True)
+    history_path = os.path.join(html_dir, "vol_scan_history.csv")
+
+    today = dt.date.today()
+
+    # Load existing history
+    if os.path.exists(history_path):
+        try:
+            hist_df = pd.read_csv(history_path, parse_dates=["Date"])
+        except Exception as e:
+            log_fn(f"[VolScan] WARNING: could not read history file: {e}")
+            hist_df = pd.DataFrame(columns=["Ticker", "Recommendation", "Date"])
+    else:
+        hist_df = pd.DataFrame(columns=["Ticker", "Recommendation", "Date"])
+
+    # Append today's entries (one per current row)
+    new_hist_rows = pd.DataFrame(
+        {
+            "Ticker": df["Ticker"],
+            "Recommendation": df["Recommendation"],
+            "Date": pd.to_datetime(today),
+        }
+    )
+
+    hist_all = pd.concat([hist_df, new_hist_rows], ignore_index=True)
+    hist_all = hist_all.dropna(subset=["Ticker", "Recommendation"])
+
+    # Save updated history back to disk
+    try:
+        hist_all.to_csv(history_path, index=False)
+    except Exception as e:
+        log_fn(f"[VolScan] WARNING: could not write history file: {e}")
+
+    # Compute DaysOnRec per ticker (= streak length of same Recommendation up to today)
+    hist_all = hist_all.sort_values(["Ticker", "Date"])
+    days_on_rec: dict[str, int] = {}
+
+    for t_sym in df["Ticker"].unique():
+        rec = df.loc[df["Ticker"] == t_sym, "Recommendation"].iloc[0]
+        t_hist = hist_all[hist_all["Ticker"] == t_sym]
+
+        if t_hist.empty:
+            days_on_rec[t_sym] = 1
+            continue
+
+        # Only consider dates up to today
+        t_hist = t_hist[t_hist["Date"] <= pd.Timestamp(today)]
+        if t_hist.empty:
+            days_on_rec[t_sym] = 1
+            continue
+
+        # Walk backwards from most recent date; count consecutive days with same rec
+        t_hist = t_hist.sort_values("Date")
+        last_date = t_hist["Date"].iloc[-1].date()
+        last_rec = t_hist["Recommendation"].iloc[-1]
+
+        if last_rec != rec:
+            # History ended with a different rec than current -> streak = 1 (today)
+            days_on_rec[t_sym] = 1
+            continue
+
+        streak_start = last_date
+        # Walk backwards while Recommendation matches current rec
+        for i in range(len(t_hist) - 2, -1, -1):
+            row_rec = t_hist["Recommendation"].iloc[i]
+            row_date = t_hist["Date"].iloc[i].date()
+            if row_rec == rec:
+                streak_start = row_date
+            else:
+                break
+
+        days_on_rec[t_sym] = (last_date - streak_start).days + 1
+
+    df["DaysOnRec"] = df["Ticker"].map(days_on_rec).astype("int64")
+
+    # Prebuild badge HTML for Vol Rec
     def _badge_html(row):
         color = row.get("RecColor", "#444")
         text = row.get("Recommendation", "")
@@ -889,12 +1004,17 @@ def build_vol_table_df(
 
     df["RecBadge"] = df.apply(_badge_html, axis=1)
 
+    # Sort within each recommendation bucket
     df = df.sort_values(
         ["Recommendation", "WeightedScore", "CategoryActiveCount", "RVOL", "BullScore"],
         ascending=[True, False, False, False, False],
     ).reset_index(drop=True)
 
     return df
+
+
+
+
 
 
 def render_vol_table_html(
@@ -928,7 +1048,7 @@ def render_vol_table_html(
         df = _attach_rec_days(df.copy(), history_path, log_fn=log_fn)
 
     tabs_list = []
-    for rec in ["GO", "WATCH", "PASS"]:
+    for rec in ["GO", "WATCH", "PASS", "JUNK"]:
         sub = df[df["Recommendation"] == rec]
         if sub.empty:
             continue
@@ -973,7 +1093,7 @@ def tab_for_vol_table(df, title: str = "Vol Scanner") -> TabPanel:
         df = _attach_rec_days(df.copy(), history_path)
 
     inner_tabs = []
-    for rec in ["GO", "WATCH", "PASS"]:
+    for rec in ["GO", "WATCH", "PASS", "JUNK"]:
         sub = df[df["Recommendation"] == rec]
         if sub.empty:
             continue
